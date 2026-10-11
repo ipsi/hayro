@@ -153,16 +153,112 @@ impl Renderer<'_> {
                         let pix_width = x_step.abs().round() as u16;
                         let pix_height = y_step.abs().round() as u16;
 
-                        let mut ctx = self.child_context(pix_width, pix_height);
-                        let mut renderer = Renderer::new(&mut ctx, self.global);
-                        renderer.inside_pattern = true;
                         let mut initial_transform = Affine::scale_non_uniform(xs as f64, ys as f64)
                             * Affine::translate((-bbox.x0, -bbox.y0));
-                        t.interpret(&mut renderer, initial_transform, is_stroke);
-                        let mut pix = Pixmap::new(pix_width, pix_height);
-                        renderer.ctx.flush();
+
+                        // The tile repeats across the whole plane, but only the part of that
+                        // plane underneath the path is ever sampled. If that part is smaller
+                        // than a single tile, we render just it. Otherwise, a pattern whose
+                        // step is the size of the page (which is how Skia writes a clamped
+                        // image shader) rasterizes a page-sized tile to fill a tiny rectangle.
+                        let (tile_width, tile_height) = (pix_width as f64, pix_height as f64);
+                        let region = (!is_stroke
+                            && x_step > 0.0
+                            && y_step > 0.0
+                            && pix_width > 0
+                            && pix_height > 0)
+                            .then(|| {
+                                let visible = path_transform
+                                    .transform_rect_bbox(path_bbox())
+                                    .intersect(Rect::new(
+                                        0.0,
+                                        0.0,
+                                        self.ctx.width() as f64,
+                                        self.ctx.height() as f64,
+                                    ));
+                                // One pixel of margin for the image filter, and then outwards to
+                                // whole pixels, so that the content keeps the pixel grid it has
+                                // in the full tile.
+                                (initial_transform * t.matrix.inverse())
+                                    .transform_rect_bbox(visible)
+                                    .inflate(1.0, 1.0)
+                                    .expand()
+                            })
+                            .filter(|r| r.is_finite());
+                        // The tiles (as column and row ranges) that the region overlaps.
+                        let cells = region.map(|r| {
+                            (
+                                (r.x0 / tile_width).floor() as i64
+                                    ..(r.x1 / tile_width).ceil() as i64,
+                                (r.y0 / tile_height).floor() as i64
+                                    ..(r.y1 / tile_height).ceil() as i64,
+                            )
+                        });
+                        // Every overlapped tile means interpreting the content once more, so
+                        // the region has to be that much smaller to be worth it.
+                        let region = region.zip(cells).filter(|(r, (cols, rows))| {
+                            let passes = (cols.end - cols.start) * (rows.end - rows.start);
+                            r.width() <= tile_width
+                                && r.height() <= tile_height
+                                && r.area() * passes as f64 <= tile_width * tile_height
+                        });
+
+                        let extend;
+                        let mut pix;
                         let mut resources = vello_cpu::Resources::default();
-                        renderer.ctx.render(&mut pix, &mut resources);
+
+                        if let Some((region, (cols, rows))) = region {
+                            let (width, height) = (region.width() as u16, region.height() as u16);
+                            let mut ctx = self.child_context(width, height);
+                            let mut renderer = Renderer::new(&mut ctx, self.global);
+                            renderer.inside_pattern = true;
+
+                            for row in rows {
+                                for col in cols.clone() {
+                                    let cell = Rect::from_origin_size(
+                                        (
+                                            col as f64 * tile_width - region.x0,
+                                            row as f64 * tile_height - region.y0,
+                                        ),
+                                        (tile_width, tile_height),
+                                    );
+                                    // The full tile cuts the content off at one step, so the
+                                    // same cut has to be made where two tiles meet.
+                                    let cut = cell.x0 > 0.0
+                                        || cell.y0 > 0.0
+                                        || cell.x1 < region.width()
+                                        || cell.y1 < region.height();
+                                    if cut {
+                                        renderer.push_clip_rect(&cell);
+                                    }
+                                    t.interpret(
+                                        &mut renderer,
+                                        Affine::translate(cell.origin().to_vec2())
+                                            * initial_transform,
+                                        is_stroke,
+                                    );
+                                    if cut {
+                                        renderer.pop_clip();
+                                    }
+                                }
+                            }
+
+                            pix = Pixmap::new(width, height);
+                            renderer.ctx.flush();
+                            renderer.ctx.render(&mut pix, &mut resources);
+                            initial_transform =
+                                Affine::translate((-region.x0, -region.y0)) * initial_transform;
+                            extend = peniko::Extend::Pad;
+                        } else {
+                            let mut ctx = self.child_context(pix_width, pix_height);
+                            let mut renderer = Renderer::new(&mut ctx, self.global);
+                            renderer.inside_pattern = true;
+                            t.interpret(&mut renderer, initial_transform, is_stroke);
+                            pix = Pixmap::new(pix_width, pix_height);
+                            renderer.ctx.flush();
+                            renderer.ctx.render(&mut pix, &mut resources);
+                            extend = peniko::Extend::Repeat;
+                        }
 
                         // TODO: Fix these
                         if x_step < 0.0 {
@@ -181,8 +277,8 @@ impl Renderer<'_> {
                         let image = Image {
                             image: ImageSource::Pixmap(Arc::new(pix)),
                             sampler: ImageSampler {
-                                x_extend: peniko::Extend::Repeat,
-                                y_extend: peniko::Extend::Repeat,
+                                x_extend: extend,
+                                y_extend: extend,
                                 quality: ImageQuality::Medium,
                                 alpha: 1.0,
                             },
